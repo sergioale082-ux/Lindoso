@@ -50,6 +50,9 @@ jobs:
               }
           }
 
+          // Bibliotecas de MP3 trazem a antiga "com.android.support", que duplica classes do AndroidX
+          configurations.all { exclude(group = "com.android.support") }
+
           dependencies {
               implementation(platform("androidx.compose:compose-bom:2024.09.03"))
               implementation("androidx.compose.ui:ui")
@@ -87,7 +90,8 @@ jobs:
           mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
           cat > 'app/src/main/AndroidManifest.xml' <<'LINDOSO_EOF'
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
 
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -97,6 +101,7 @@ jobs:
               <application
                   android:name=".LindosoApp"
                   android:allowBackup="false"
+                  tools:replace="android:allowBackup"
                   android:icon="@drawable/ic_launcher"
                   android:label="@string/app_name"
                   android:theme="@style/Theme.Lindoso"
@@ -1592,6 +1597,7 @@ jobs:
           org.gradle.jvmargs=-Xmx2g
           android.useAndroidX=true
           android.nonTransitiveRClass=true
+          android.suppressUnsupportedCompileSdk=35
           LINDOSO_EOF
           mkdir -p "$(dirname 'settings.gradle.kts')"
           cat > 'settings.gradle.kts' <<'LINDOSO_EOF'
