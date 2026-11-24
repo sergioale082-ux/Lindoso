@@ -26,6 +26,7 @@ jobs:
                   targetSdk = 35
                   versionCode = 1
                   versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }   // celulares reais; deixa o APK menor com o FFmpeg
               }
 
               buildTypes {
@@ -45,6 +46,7 @@ jobs:
               buildFeatures { compose = true }
               packaging {
                   resources.excludes += setOf("META-INF/*.kotlin_module", "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "DebugProbesKt.bin")
+                  jniLibs.pickFirsts += setOf("**/libc++_shared.so")   // FFmpeg e LAME trazem a mesma biblioteca
               }
           }
 
@@ -59,7 +61,13 @@ jobs:
               // Extração de YouTube (busca, sugestões, streams, playlists) — sem login e sem API key
               // Confira a versão mais recente em https://jitpack.io/#TeamNewPipe/NewPipeExtractor
               implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.6")
-              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.2")
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.2")   // versão NIO: o NewPipeExtractor precisa (URLDecoder etc. em Android < 13)
+
+              // Codificador MP3 (LAME) para a opção de download em MP3
+              implementation("com.github.NorthernCaptain:TAndroidLame:1.1")
+
+              // FFmpeg (variante "full", com libmp3lame) — conversão principal para MP3
+              implementation("io.github.jamaismagic.ffmpeg:ffmpeg-kit-lts-full-16kb:6.1.4")
           }
           LINDOSO_EOF
           mkdir -p "$(dirname 'app/proguard-rules.pro')"
@@ -72,6 +80,9 @@ jobs:
           -keep class org.schabi.newpipe.extractor.timeago.patterns.** { *; }
           -keep class org.schabi.newpipe.extractor.services.youtube.protos.** { *; }
           -keep class com.google.protobuf.** { *; }
+          -keep class com.naman14.androidlame.** { *; }
+          -keep class com.arthenica.** { *; }
+          -dontwarn com.arthenica.**
           LINDOSO_EOF
           mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
           cat > 'app/src/main/AndroidManifest.xml' <<'LINDOSO_EOF'
@@ -84,6 +95,7 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <application
+                  android:name=".LindosoApp"
                   android:allowBackup="false"
                   android:icon="@drawable/ic_launcher"
                   android:label="@string/app_name"
@@ -97,6 +109,20 @@ jobs:
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <!-- Aparece em Compartilhar do YouTube (igual ao Snaptube) -->
+                  <activity
+                      android:name=".ShareActivity"
+                      android:exported="true"
+                      android:excludeFromRecents="true"
+                      android:label="Lindoso Download"
+                      android:theme="@style/Theme.Lindoso.Sheet">
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
                       </intent-filter>
                   </activity>
 
@@ -119,6 +145,8 @@ jobs:
           import kotlinx.coroutines.flow.MutableStateFlow
           import kotlinx.coroutines.flow.update
           import org.schabi.newpipe.extractor.MediaFormat
+          import org.schabi.newpipe.extractor.stream.AudioStream
+          import org.schabi.newpipe.extractor.stream.DeliveryMethod
           import org.schabi.newpipe.extractor.stream.StreamInfo
           import org.schabi.newpipe.extractor.stream.VideoStream
           import java.io.File
@@ -130,13 +158,21 @@ jobs:
 
           enum class St { QUEUED, RUNNING, PAUSED, WAITING, DONE, ERROR }
 
+          /** height == null -> só áudio; afmt = mp3 | m4a | opus | ogg | wav (usado só quando é áudio) */
           data class DlState(
-              val id: Long, val title: String, val url: String, val height: Int?,   // height == null -> só áudio
+              val id: Long, val title: String, val url: String, val height: Int?, val afmt: String = "m4a",
               val progress: Float = 0f, val st: St = St.QUEUED, val msg: String = ""
           )
 
           private class PauseEx : Exception()
-          private class Picked(val urls: List<String>, val ext: String, val mime: String)
+          private class HttpErr(val code: Int) : Exception("HTTP $code")
+          private class Picked(val urls: List<String>, val ext: String, val mime: String, val conv: String = "")
+
+          private const val UA_ANDROID = "com.google.android.youtube/20.10.38 (Linux; U; Android 15; en_US) gzip"
+          private const val UA_ANDROID_VR = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+          private const val UA_IOS = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+          private val cParam = Regex("""[?&]c=([A-Z_]+)""")
+          private val clenParam = Regex("""[?&]clen=(\d+)""")
 
           /** Fila de downloads: um por vez, pausa/retomada por HTTP Range, retry automático quando a internet cai. */
           object Dl {
@@ -154,34 +190,68 @@ jobs:
                   scope.launch { for (id in queue) runJob(id) }
               }
 
-              fun enqueue(items: List<Pair<String, String>>, height: Int?) {
-                  val new = items.map { (u, t) -> DlState(++seq, t, u, height) }
+              fun enqueue(items: List<Pair<String, String>>, height: Int?, afmt: String = "m4a") {
+                  val new = items.map { (u, t) -> DlState(++seq, t, u, height, afmt) }
                   jobs.update { it + new }
                   new.forEach { queue.trySend(it.id) }
-                  ContextCompat.startForegroundService(app, Intent(app, DlService::class.java))
+                  runCatching { ContextCompat.startForegroundService(app, Intent(app, DlService::class.java)) }
               }
 
               fun pause(id: Long) { paused += id }
               fun resume(id: Long) {
                   paused -= id
-                  upd(id) { it.copy(st = St.QUEUED) }
+                  upd(id) { it.copy(st = St.QUEUED, msg = "") }
                   queue.trySend(id)
-                  ContextCompat.startForegroundService(app, Intent(app, DlService::class.java))
+                  runCatching { ContextCompat.startForegroundService(app, Intent(app, DlService::class.java)) }
               }
 
               private fun upd(id: Long, f: (DlState) -> DlState) = jobs.update { l -> l.map { if (it.id == id) f(it) else it } }
 
               private fun h(s: VideoStream) = s.resolution.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
 
-              private fun pick(info: StreamInfo, height: Int?): Picked {
-                  val a = info.audioStreams.filter { it.format == MediaFormat.M4A }.maxByOrNull { it.averageBitrate }
-                  if (height == null) return Picked(listOf((a ?: error("sem áudio disponível")).content), "m4a", "audio/mp4")
-                  val muxed = info.videoStreams.filter { it.format == MediaFormat.MPEG_4 && h(it) <= height }.maxByOrNull { h(it) }
-                  val vo = info.videoOnlyStreams.filter { it.format == MediaFormat.MPEG_4 && h(it) <= height }.maxByOrNull { h(it) }
+              private fun pk(s: AudioStream, conv: String = "") =
+                  if (s.format?.suffix == "m4a") Picked(listOf(s.content), "m4a", "audio/mp4", conv)
+                  else Picked(listOf(s.content), "webm", "audio/webm", conv)
+
+              private fun pick(info: StreamInfo, height: Int?, afmt: String): Picked {
+                  val prog = DeliveryMethod.PROGRESSIVE_HTTP
+                  val aAll = info.audioStreams.filter { it.deliveryMethod == prog }.ifEmpty { info.audioStreams }
+                  // evita pegar faixa dublada em outro idioma: prefere a faixa original
+                  val aOrig = aAll.filter { it.audioTrackType == null || it.audioTrackType?.name == "ORIGINAL" }.ifEmpty { aAll }
+                  fun best(suffix: String) = aOrig.filter { it.format?.suffix == suffix }.maxByOrNull { it.averageBitrate }
+                  val m4a = best("m4a")
+                  val webm = best("webm")
+
+                  if (height == null) {
+                      return when {
+                          afmt == "opus" -> pk(webm ?: error("áudio Opus indisponível neste vídeo"))
+                          afmt == "ogg" -> pk(webm ?: error("OGG precisa de áudio Opus, indisponível neste vídeo"), "ogg")
+                          afmt == "wav" -> pk(m4a ?: webm ?: error("sem áudio disponível"), "wav")
+                          afmt.startsWith("mp3") -> pk(m4a ?: webm ?: error("sem áudio disponível"), "mp3")
+                          else -> pk(m4a ?: webm ?: error("sem áudio disponível"))
+                      }
+                  }
+                  val vAll = info.videoStreams.filter { it.deliveryMethod == prog }.ifEmpty { info.videoStreams }
+                  val vOnlyAll = info.videoOnlyStreams.filter { it.deliveryMethod == prog }.ifEmpty { info.videoOnlyStreams }
+                  val muxed = vAll.filter { it.format == MediaFormat.MPEG_4 && h(it) <= height }.maxByOrNull { h(it) }
+                  val vo = vOnlyAll.filter { it.format == MediaFormat.MPEG_4 && h(it) <= height }.maxByOrNull { h(it) }
                   return when {
-                      vo != null && a != null && h(vo) > (muxed?.let { h(it) } ?: 0) -> Picked(listOf(vo.content, a.content), "mp4", "video/mp4")
+                      vo != null && m4a != null && h(vo) > (muxed?.let { h(it) } ?: 0) -> Picked(listOf(vo.content, m4a.content), "mp4", "video/mp4")
                       muxed != null -> Picked(listOf(muxed.content), "mp4", "video/mp4")
                       else -> error("formato indisponível para este vídeo")
+                  }
+              }
+
+              private fun friendly(e: Throwable): String {
+                  val n = e.javaClass.simpleName
+                  return when {
+                      n.contains("AgeRestricted") -> "Vídeo com restrição de idade"
+                      n.contains("Private") -> "Vídeo privado"
+                      n.contains("GeographicRestriction") -> "Vídeo bloqueado na sua região"
+                      n.contains("Paid") || n.contains("Members") -> "Vídeo exclusivo para membros/pago"
+                      n.contains("ContentNotAvailable") || n.contains("ContentNotSupported") -> "Vídeo indisponível (removido, bloqueado ou ao vivo)"
+                      n.contains("ReCaptcha") || n.contains("SignInConfirm") -> "YouTube pediu verificação. Espere alguns minutos e tente de novo"
+                      else -> "$n: ${e.message}".take(140)
                   }
               }
 
@@ -190,63 +260,132 @@ jobs:
                   if (id in paused) { upd(id) { it.copy(st = St.PAUSED) }; return }
                   upd(id) { it.copy(st = St.RUNNING, msg = "") }
                   var tries = 0
+                  var authTries = 0
                   while (true) {
                       try {
                           val info = StreamInfo.getInfo(s.url)
                           upd(id) { it.copy(title = info.name) }
-                          val p = pick(info, s.height)
+                          val p = pick(info, s.height, s.afmt)
                           val dir = File(app.cacheDir, "dl").also { it.mkdirs() }
                           val parts = p.urls.indices.map { File(dir, "$id-$it.part") }
+                          val queryRange = authTries > 0
                           p.urls.forEachIndexed { i, u ->
-                              fetch(id, u, parts[i]) { fr -> upd(id) { it.copy(progress = (i + fr) / p.urls.size, st = St.RUNNING, msg = "") } }
+                              fetch(id, u, parts[i], queryRange) { fr -> upd(id) { it.copy(progress = (i + fr) / p.urls.size * (if (p.conv == "mp3") 0.9f else 1f), st = St.RUNNING, msg = "") } }
                           }
-                          val out = if (parts.size == 2) File(dir, "$id.mp4").also { Muxer.mux(parts[0], parts[1], it) } else parts[0]
+                          var out = if (parts.size == 2) File(dir, "$id.mp4").also {
+                              upd(id) { j -> j.copy(progress = 1f, msg = "Juntando vídeo e áudio…") }
+                              Muxer.mux(parts[0], parts[1], it)
+                          } else parts[0]
+                          var note = ""
+                          var ext = p.ext
+                          var mime = p.mime
+                          when (p.conv) {
+                              "wav" -> {
+                                  upd(id) { it.copy(progress = 1f, msg = "Convertendo para WAV…") }
+                                  val w = File(dir, "$id.wav")
+                                  Muxer.toWav(parts[0], w)
+                                  out = w; ext = "wav"; mime = "audio/wav"
+                              }
+                              "mp3" -> {
+                                  // conversão silenciosa: o usuário só vê um download que termina já em MP3
+                                  upd(id) { it.copy(progress = 0.95f, msg = "") }
+                                  val kbps = s.afmt.substringAfter('_', "192").toIntOrNull()?.takeIf { it in listOf(128, 192, 256, 320) } ?: 192
+                                  val g = File(dir, "$id.mp3")
+                                  // 1º FFmpeg; se falhar, 2º o conversor LAME embutido; se os dois falharem, cai no áudio original
+                                  val r = runCatching { Ffmpeg.toMp3(parts[0], g, kbps) }
+                                      .recoverCatching { g.delete(); Muxer.toMp3(parts[0], g, kbps) }
+                                  if (r.isSuccess && g.length() > 0) { out = g; ext = "mp3"; mime = "audio/mpeg" }
+                                  else {                                                    // falhou: entrega o áudio original e avisa, sem quebrar nada
+                                      g.delete()
+                                      val orig = if (ext == "m4a") "M4A" else "OPUS (WEBM)"
+                                      note = "não deu para converter em MP3, salvo como $orig"
+                                      android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                          android.widget.Toast.makeText(app, "Não foi possível converter para MP3. Salvei como $orig.", android.widget.Toast.LENGTH_LONG).show()
+                                      }
+                                  }
+                              }
+                              "ogg" -> {
+                                  upd(id) { it.copy(progress = 1f, msg = "Convertendo para OGG…") }
+                                  val g = File(dir, "$id.ogg")
+                                  val ok = runCatching { Muxer.toOgg(parts[0], g) }.isSuccess
+                                  if (ok) { out = g; ext = "ogg"; mime = "audio/ogg" } else g.delete()   // se o aparelho não suportar, salva o Opus original (.webm)
+                              }
+                          }
                           val safe = info.name.replace(Regex("""[\\/:*?"<>|]"""), "_").take(80)
-                          Library.save(app, out, "$safe.${p.ext}", p.mime)
+                          Library.save(app, out, "$safe.$ext", mime)
                           parts.forEach { it.delete() }; out.delete()
-                          upd(id) { it.copy(progress = 1f, st = St.DONE) }
+                          upd(id) { it.copy(progress = 1f, st = St.DONE, msg = note) }
                           return
                       } catch (e: PauseEx) {
                           upd(id) { it.copy(st = St.PAUSED) }; return
+                      } catch (e: HttpErr) {
+                          // link expirado/recusado: pega um link novo e tenta de novo (2ª tentativa usa outro modo de Range)
+                          if ((e.code == 401 || e.code == 403 || e.code == 410) && ++authTries <= 3) {
+                              upd(id) { it.copy(st = St.WAITING, msg = "Renovando link…") }
+                              delay(1500)
+                              if (id in paused) { upd(id) { it.copy(st = St.PAUSED) }; return }
+                          } else {
+                              upd(id) { it.copy(st = St.ERROR, msg = if (e.code == 403) "YouTube bloqueou este download (HTTP 403)" else "Erro HTTP ${e.code}") }; return
+                          }
                       } catch (e: IOException) {                       // internet caiu: espera e continua de onde parou
                           if (++tries > 30) { upd(id) { it.copy(st = St.ERROR, msg = "Sem conexão") }; return }
                           upd(id) { it.copy(st = St.WAITING, msg = "Aguardando internet…") }
                           delay(5000)
                           if (id in paused) { upd(id) { it.copy(st = St.PAUSED) }; return }
-                      } catch (e: Exception) {
-                          upd(id) { it.copy(st = St.ERROR, msg = e.message ?: "Erro") }; return
+                      } catch (e: Throwable) {
+                          upd(id) { it.copy(st = St.ERROR, msg = friendly(e)) }; return
                       }
                   }
               }
 
-              /** Baixa em blocos de 5 MB com Range (o YouTube limita a velocidade de requisições sem Range) e retoma pelo tamanho do .part. */
-              private fun fetch(id: Long, url: String, f: File, prog: (Float) -> Unit) {
+              private fun uaFor(u: String) = when (cParam.find(u)?.groupValues?.get(1)) {
+                  "ANDROID_VR" -> UA_ANDROID_VR
+                  "ANDROID" -> UA_ANDROID
+                  "IOS" -> UA_IOS
+                  else -> UA
+              }
+
+              /**
+               * Baixa em blocos de 5 MB e retoma pelo tamanho do .part.
+               * queryRange=false: cabeçalho Range (padrão). queryRange=true: parâmetro &range= na URL (como o player do YouTube faz).
+               * O User-Agent precisa combinar com o cliente que gerou o link (c=ANDROID / c=IOS), senão o YouTube responde 403.
+               */
+              private fun fetch(id: Long, url: String, f: File, queryRange: Boolean, prog: (Float) -> Unit) {
                   val chunk = 5_000_000L
+                  val clen = clenParam.find(url)?.groupValues?.get(1)?.toLongOrNull()
+                  val ua = uaFor(url)
                   var have = f.length()
                   while (true) {
                       if (id in paused) throw PauseEx()
-                      val c = URL(url).openConnection() as HttpURLConnection
+                      val target = if (queryRange) "$url&range=$have-${have + chunk - 1}" else url
+                      val c = URL(target).openConnection() as HttpURLConnection
                       c.connectTimeout = 15000; c.readTimeout = 20000
-                      c.setRequestProperty("User-Agent", UA)
-                      c.setRequestProperty("Range", "bytes=$have-${have + chunk - 1}")
+                      c.setRequestProperty("User-Agent", ua)
+                      c.setRequestProperty("Accept-Encoding", "identity")
+                      if (ua == UA) { c.setRequestProperty("Origin", "https://www.youtube.com"); c.setRequestProperty("Referer", "https://www.youtube.com/") }
+                      if (!queryRange) c.setRequestProperty("Range", "bytes=$have-${have + chunk - 1}")
                       val code = c.responseCode
                       if (code == 416) { c.disconnect(); return }                 // já estava completo
-                      if (code != 206 && code != 200) { c.disconnect(); throw IOException("HTTP $code") }
-                      val total = c.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: c.contentLengthLong
-                      if (code == 200 && have > 0) { f.delete(); have = 0 }       // servidor ignorou o Range
+                      if (code != 206 && code != 200) { c.disconnect(); throw HttpErr(code) }
+                      val hdrTotal = c.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull()
+                      val total: Long = hdrTotal ?: clen ?: (if (!queryRange) c.contentLengthLong else -1L)
+                      if (!queryRange && code == 200 && have > 0) { f.delete(); have = 0 }   // servidor ignorou o Range
+                      var got = 0L
                       FileOutputStream(f, have > 0).use { o ->
                           c.inputStream.use { i ->
                               val b = ByteArray(32 * 1024)
                               while (true) {
                                   val n = i.read(b); if (n < 0) break
-                                  o.write(b, 0, n); have += n
-                                  prog(have.toFloat() / total)
+                                  o.write(b, 0, n); have += n; got += n
+                                  prog(if (total > 0) (have.toFloat() / total).coerceIn(0f, 1f) else 0f)
                                   if (id in paused) throw PauseEx()
                               }
                           }
                       }
                       c.disconnect()
-                      if (have >= total) return
+                      if (got <= 0L) throw IOException("sem dados do servidor")
+                      if (total > 0) { if (have >= total) return }
+                      else if (!queryRange || got < chunk) return
                   }
               }
           }
@@ -275,7 +414,7 @@ jobs:
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   val nm = getSystemService(NotificationManager::class.java)
                   nm.createNotificationChannel(NotificationChannel("dl", "Downloads", NotificationManager.IMPORTANCE_LOW))
-                  startForeground(1, build("Iniciando…", 0), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  runCatching { startForeground(1, build("Iniciando…", 0), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) }
                   if (watcher == null) watcher = scope.launch {
                       Dl.jobs.collect { l ->
                           val active = l.filter { it.st == St.RUNNING || it.st == St.QUEUED || it.st == St.WAITING }
@@ -292,11 +431,29 @@ jobs:
                       .setSmallIcon(android.R.drawable.stat_sys_download)
                       .setContentTitle("Lindoso Download")
                       .setContentText(text)
-                      .setProgress(100, pct, false)
+                      .setProgress(100, pct.coerceIn(0, 100), false)
                       .setOngoing(true)
                       .build()
 
               override fun onDestroy() { scope.cancel(); watcher = null; super.onDestroy() }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/Ffmpeg.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/Ffmpeg.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import java.io.File
+
+          /** Conversão para MP3 com FFmpeg (FFmpegKit). Chamado por reflexão: se a biblioteca faltar ou falhar, quem chama usa o plano B. */
+          object Ffmpeg {
+              fun toMp3(src: File, out: File, kbps: Int) {
+                  val kit = Class.forName("com.arthenica.ffmpegkit.FFmpegKit")
+                  val cmd = "-y -i \"${src.path}\" -vn -map_metadata -1 -c:a libmp3lame -b:a ${kbps}k -ac 2 \"${out.path}\""
+                  val session = kit.getMethod("execute", String::class.java).invoke(null, cmd) ?: error("FFmpeg não respondeu")
+                  val rc = session.javaClass.getMethod("getReturnCode").invoke(session)
+                  val ok = rc != null && rc.javaClass.getMethod("isValueSuccess").invoke(rc) as Boolean
+                  if (!ok || out.length() == 0L) error("FFmpeg não conseguiu gerar o MP3")
+              }
           }
           LINDOSO_EOF
           mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/HttpDownloader.kt')"
@@ -381,6 +538,27 @@ jobs:
               }
           }
           LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/LindosoApp.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/LindosoApp.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.app.Application
+          import android.util.Log
+          import java.io.File
+
+          class LindosoApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  val old = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      runCatching { File(filesDir, "crash.txt").writeText(Log.getStackTraceString(e)) }
+                      old?.uncaughtException(t, e)
+                  }
+                  YtRepo.init()
+                  Dl.start(this)
+              }
+          }
+          LINDOSO_EOF
           mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/MainActivity.kt')"
           cat > 'app/src/main/java/com/lindoso/download/MainActivity.kt' <<'LINDOSO_EOF'
           package com.lindoso.download
@@ -394,12 +572,11 @@ jobs:
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  YtRepo.init()
-                  Dl.start(this)
                   if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
                   setContent {
                       LindosoTheme {
                           CopyrightNotice(onExit = { finish() })
+                          CrashReport()
                           App()
                       }
                   }
@@ -412,11 +589,16 @@ jobs:
 
           import android.media.MediaCodec
           import android.media.MediaExtractor
+          import android.media.MediaFormat
           import android.media.MediaMuxer
           import java.io.File
+          import java.io.FileOutputStream
+          import java.lang.reflect.Method
+          import java.io.RandomAccessFile
           import java.nio.ByteBuffer
+          import java.nio.ByteOrder
 
-          /** Junta vídeo (H.264) + áudio (AAC) em um MP4 usando só APIs nativas do Android (zero KB extra no APK). */
+          /** Junta vídeo (H.264) + áudio (AAC) em MP4 e converte áudio usando só APIs nativas do Android (zero KB extra no APK). */
           object Muxer {
               fun mux(video: File, audio: File, out: File) {
                   val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -430,6 +612,160 @@ jobs:
                       copy(ve, m, vi); copy(ae, m, ai)
                       m.stop()
                   } finally { ve.release(); ae.release(); m.release() }
+              }
+
+              /** Opus (webm) -> OGG, sem recodificar. */
+              fun toOgg(src: File, out: File) {
+                  val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_OGG)
+                  val e = MediaExtractor().apply { setDataSource(src.path) }
+                  try {
+                      val t = track(e, "audio/")
+                      e.selectTrack(t)
+                      val i = m.addTrack(e.getTrackFormat(t))
+                      m.start()
+                      copy(e, m, i)
+                      m.stop()
+                  } finally { e.release(); m.release() }
+              }
+
+              /** Qualquer áudio (AAC/Opus) -> WAV PCM 16 bits, decodificando com o MediaCodec do sistema. */
+              fun toWav(src: File, out: File) {
+                  RandomAccessFile(out, "rw").use { f ->
+                      f.setLength(0)
+                      f.write(ByteArray(44))
+                      var bytes = 0L
+                      var rate = 44100
+                      var chan = 2
+                      decodePcm(src) { d, s, c -> f.write(d); bytes += d.size; rate = s; chan = c }
+                      f.seek(0)
+                      f.write(wavHeader(bytes, rate, chan))
+                  }
+              }
+
+              /** Qualquer áudio -> MP3 (LAME via biblioteca TAndroidLame). Entrada decodificada pelo MediaCodec. */
+              fun toMp3(src: File, out: File, kbps: Int = 192) {
+                  var lame: LameRef? = null
+                  var mp3 = ByteArray(0)
+                  FileOutputStream(out).use { o ->
+                      try {
+                          decodePcm(src) { d, sr, ch ->
+                              val l = lame ?: LameRef(sr, kbps).also { lame = it }
+                              val shorts = ShortArray(d.size / 2)
+                              ByteBuffer.wrap(d).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+                              val frames = shorts.size / ch
+                              // sempre entrega estéreo intercalado ao LAME (mono vira L=R)
+                              val st = ShortArray(frames * 2)
+                              for (i in 0 until frames) {
+                                  st[2 * i] = shorts[i * ch]
+                                  st[2 * i + 1] = shorts[i * ch + (if (ch > 1) 1 else 0)]
+                              }
+                              val need = (frames * 1.25 + 7200).toInt()
+                              if (mp3.size < need) mp3 = ByteArray(need)
+                              val n = l.encode(st, frames, mp3)
+                              if (n < 0) error("LAME erro $n")
+                              o.write(mp3, 0, n)
+                          }
+                          val l = lame ?: error("áudio vazio")
+                          if (mp3.size < 7200) mp3 = ByteArray(7200)
+                          val n = l.flush(mp3)
+                          if (n > 0) o.write(mp3, 0, n)
+                      } finally {
+                          lame?.close()
+                      }
+                  }
+              }
+
+              /** Acessa a biblioteca por reflexão para não depender do nome exato dos métodos em tempo de compilação. */
+              private class LameRef(sr: Int, kbps: Int) {
+                  private val inst: Any
+                  private val mEnc: Method
+                  private val mFlush: Method
+                  private val mClose: Method?
+
+                  init {
+                      val ip = Int::class.javaPrimitiveType!!
+                      val bc = Class.forName("com.naman14.androidlame.LameBuilder")
+                      val b = bc.getDeclaredConstructor().newInstance()
+                      fun set(name: String, v: Int) { bc.getMethod(name, ip).invoke(b, v) }
+                      set("setInSampleRate", sr)
+                      set("setOutChannels", 2)
+                      set("setOutBitrate", kbps)
+                      set("setQuality", 3)
+                      inst = bc.getMethod("build").invoke(b)!!
+                      val c = inst.javaClass
+                      mEnc = c.getMethod("encodeBufferInterleaved", ShortArray::class.java, ip, ByteArray::class.java)
+                      mFlush = runCatching { c.getMethod("flush", ByteArray::class.java) }.getOrElse { c.getMethod("lameFlush", ByteArray::class.java) }
+                      mClose = runCatching { c.getMethod("close") }.getOrElse { runCatching { c.getMethod("lameClose") }.getOrNull() }
+                  }
+
+                  fun encode(pcm: ShortArray, frames: Int, buf: ByteArray): Int = mEnc.invoke(inst, pcm, frames, buf) as Int
+                  fun flush(buf: ByteArray): Int = mFlush.invoke(inst, buf) as Int
+                  fun close() { runCatching { mClose?.invoke(inst) } }
+              }
+
+              /** Decodifica o áudio para PCM 16 bits e entrega cada bloco (dados, taxa, canais). */
+              private fun decodePcm(src: File, onData: (ByteArray, Int, Int) -> Unit) {
+                  val ex = MediaExtractor().apply { setDataSource(src.path) }
+                  var codec: MediaCodec? = null
+                  try {
+                      val t = track(ex, "audio/")
+                      ex.selectTrack(t)
+                      val fmt = ex.getTrackFormat(t)
+                      var sr = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                      var ch = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                      val dec = MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME)!!)
+                      codec = dec
+                      dec.configure(fmt, null, null, 0)
+                      dec.start()
+                      val info = MediaCodec.BufferInfo()
+                      var inDone = false
+                      var outDone = false
+                      while (!outDone) {
+                          if (!inDone) {
+                              val i = dec.dequeueInputBuffer(10_000)
+                              if (i >= 0) {
+                                  val b = dec.getInputBuffer(i)!!
+                                  val n = ex.readSampleData(b, 0)
+                                  if (n < 0) {
+                                      dec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                      inDone = true
+                                  } else {
+                                      dec.queueInputBuffer(i, 0, n, ex.sampleTime, 0)
+                                      ex.advance()
+                                  }
+                              }
+                          }
+                          val o = dec.dequeueOutputBuffer(info, 10_000)
+                          if (o >= 0) {
+                              val b = dec.getOutputBuffer(o)!!
+                              if (info.size > 0) {
+                                  val arr = ByteArray(info.size)
+                                  b.position(info.offset)
+                                  b.get(arr)
+                                  onData(arr, sr, ch)
+                              }
+                              dec.releaseOutputBuffer(o, false)
+                              if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outDone = true
+                          } else if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              val nf = dec.outputFormat
+                              if (nf.containsKey(MediaFormat.KEY_SAMPLE_RATE)) sr = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                              if (nf.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) ch = nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                          }
+                      }
+                  } finally {
+                      runCatching { codec?.stop() }
+                      runCatching { codec?.release() }
+                      ex.release()
+                  }
+              }
+
+              private fun wavHeader(dataLen: Long, sr: Int, ch: Int): ByteArray {
+                  val b = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+                  b.put("RIFF".toByteArray()); b.putInt((36 + dataLen).toInt()); b.put("WAVE".toByteArray())
+                  b.put("fmt ".toByteArray()); b.putInt(16); b.putShort(1); b.putShort(ch.toShort())
+                  b.putInt(sr); b.putInt(sr * ch * 2); b.putShort((ch * 2).toShort()); b.putShort(16)
+                  b.put("data".toByteArray()); b.putInt(dataLen.toInt())
+                  return b.array()
               }
 
               private fun track(e: MediaExtractor, prefix: String): Int =
@@ -448,20 +784,99 @@ jobs:
               }
           }
           LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/ShareActivity.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/ShareActivity.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          /** Aparece no menu Compartilhar do YouTube: escolhe o formato e baixa, sem abrir o app. */
+          class ShareActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+                  if (!YtRepo.isYt(text)) { toast("Link do YouTube não encontrado"); finish(); return }
+                  if (!getSharedPreferences("p", MODE_PRIVATE).getBoolean("ok", false)) {
+                      toast("Abra o Lindoso Download uma vez para aceitar o aviso de direitos autorais"); finish(); return
+                  }
+                  val url = YtRepo.extract(text)
+                  setContent {
+                      LindosoTheme {
+                          val scope = rememberCoroutineScope()
+                          var busy by remember { mutableStateOf(false) }
+                          Box(
+                              Modifier.fillMaxSize().clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { finish() },
+                              contentAlignment = Alignment.BottomCenter
+                          ) {
+                              Column(
+                                  Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)).background(Color(0xFF151515))
+                                      .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
+                                      .padding(20.dp)
+                              ) {
+                                  FormatPicker(url, YtRepo.hasList(url), busy) { h, a, whole ->
+                                      scope.launch {
+                                          busy = true
+                                          startDownload(url, url, whole, h, a)
+                                          toast("Baixando… acompanhe em Lindoso Download")
+                                          finish()
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+          }
+          LINDOSO_EOF
           mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/Ui.kt')"
           cat > 'app/src/main/java/com/lindoso/download/Ui.kt' <<'LINDOSO_EOF'
           package com.lindoso.download
 
+          import android.content.ClipData
           import android.content.ClipboardManager
           import android.content.Context
           import android.graphics.Bitmap
           import android.graphics.BitmapFactory
+          import android.app.Activity
+          import android.view.ViewGroup
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
           import android.widget.MediaController
+          import androidx.activity.compose.BackHandler
           import android.widget.VideoView
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
@@ -481,6 +896,7 @@ jobs:
           import androidx.compose.ui.text.input.ImeAction
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
           import androidx.compose.ui.window.Dialog
           import androidx.lifecycle.Lifecycle
@@ -490,6 +906,7 @@ jobs:
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
+          import java.io.File
           import java.net.URL
 
           val Turq = Color(0xFF00E5C7)
@@ -549,53 +966,54 @@ jobs:
               }
           }
 
+          fun isVideoUrl(u: String) = YtRepo.isYt(u) &&
+              (u.contains("watch?v=") || u.contains("/shorts/") || u.contains("youtu.be/") || u.contains("list="))
+
+          /** WebView do YouTube mantido vivo entre as abas (não recarrega ao trocar de aba). */
+          object Web {
+              var view: WebView? = null
+              fun get(c: Context, onUrl: (String) -> Unit): WebView {
+                  val w = view ?: WebView(c).apply {
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      setBackgroundColor(android.graphics.Color.BLACK)
+                      loadUrl("https://m.youtube.com")
+                  }.also { view = it }
+                  (w.parent as? ViewGroup)?.removeView(w)
+                  w.webViewClient = object : WebViewClient() {
+                      override fun doUpdateVisitedHistory(v: WebView, url: String, isReload: Boolean) { onUrl(url) }
+                      override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest) = r.url.scheme?.startsWith("http") != true
+                  }
+                  return w
+              }
+          }
+
           // ───────────────────────── Início ─────────────────────────
           @Composable
           fun HomeTab() {
               val ctx = LocalContext.current
-              var link by remember { mutableStateOf("") }
-              var clip by remember { mutableStateOf<String?>(null) }
               var dialogUrl by remember { mutableStateOf<String?>(null) }
+              var webUrl by remember { mutableStateOf(Web.view?.url ?: "") }
               val jobs by Dl.jobs.collectAsState()
 
-              // Detecta link do YouTube copiado ao abrir/voltar pro app
-              val owner = LocalLifecycleOwner.current
-              DisposableEffect(owner) {
-                  val o = LifecycleEventObserver { _, e ->
-                      if (e == Lifecycle.Event.ON_RESUME) {
-                          val t = ctx.getSystemService(ClipboardManager::class.java).primaryClip?.getItemAt(0)?.text?.toString()
-                          clip = t?.takeIf { YtRepo.isYt(it) }?.let { YtRepo.extract(it) }
+              Column(Modifier.fillMaxSize()) {
+                  // YouTube embutido: sem cabeçalho, sobe até logo abaixo da barra de status e vai até a barra de baixo
+                  Box(Modifier.weight(1f).fillMaxWidth()) {
+                      BackHandler { val w = Web.view; if (w != null && w.canGoBack()) w.goBack() else (ctx as? Activity)?.finish() }
+                      AndroidView({ c -> Web.get(c) { webUrl = it } }, Modifier.fillMaxSize())
+                  }
+                  if (isVideoUrl(webUrl)) {
+                      Button(
+                          { dialogUrl = webUrl }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                          colors = ButtonDefaults.buttonColors(containerColor = Turq, contentColor = Color.Black)
+                      ) { Text("Baixar este vídeo") }
+                  }
+                  if (jobs.isNotEmpty()) {
+                      Column(Modifier.padding(horizontal = 16.dp)) {
+                          Text("Downloads", color = Color.Gray, modifier = Modifier.padding(top = 4.dp))
+                          LazyColumn(Modifier.heightIn(max = 150.dp)) { items(jobs.reversed(), key = { it.id }) { JobRow(it) } }
                       }
                   }
-                  owner.lifecycle.addObserver(o); onDispose { owner.lifecycle.removeObserver(o) }
-              }
-
-              Column(Modifier.fillMaxSize().padding(16.dp)) {
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                      androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(R.drawable.ic_launcher), null, Modifier.size(40.dp))
-                      Spacer(Modifier.width(10.dp))
-                      Text("Lindoso Download", color = Turq, style = MaterialTheme.typography.headlineSmall)
-                  }
-                  Spacer(Modifier.height(12.dp))
-                  OutlinedTextField(
-                      link, { link = it }, Modifier.fillMaxWidth(), singleLine = true,
-                      label = { Text("Cole o link do YouTube") },
-                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-                      keyboardActions = KeyboardActions(onGo = { if (YtRepo.isYt(link)) dialogUrl = YtRepo.extract(link) })
-                  )
-                  clip?.let { c ->
-                      Spacer(Modifier.height(8.dp))
-                      Card(Modifier.fillMaxWidth().clickable { dialogUrl = c }, colors = CardDefaults.cardColors(containerColor = Color(0xFF0F2B28))) {
-                          Column(Modifier.padding(12.dp)) {
-                              Text("Link copiado detectado", color = Turq)
-                              Text(c, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.White)
-                              Text("Toque para baixar", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
-                          }
-                      }
-                  }
-                  Spacer(Modifier.height(16.dp))
-                  Text("Downloads", color = Color.Gray)
-                  LazyColumn { items(jobs.reversed(), key = { it.id }) { JobRow(it) } }
               }
               dialogUrl?.let { FormatDialog(it, it) { dialogUrl = null } }
           }
@@ -608,8 +1026,8 @@ jobs:
                   Row(verticalAlignment = Alignment.CenterVertically) {
                       Text(
                           when (j.st) {
-                              St.QUEUED -> "Na fila"; St.RUNNING -> "${(j.progress * 100).toInt()}%"; St.PAUSED -> "Pausado"
-                              St.WAITING -> j.msg; St.DONE -> "Concluído ✓"; St.ERROR -> "Erro: ${j.msg}"
+                              St.QUEUED -> "Na fila"; St.RUNNING -> if (j.msg.isNotEmpty()) j.msg else "${(j.progress * 100).toInt()}%"; St.PAUSED -> "Pausado"
+                              St.WAITING -> j.msg; St.DONE -> if (j.msg.isNotEmpty()) "Concluído ✓ (${j.msg})" else "Concluído ✓"; St.ERROR -> "Erro: ${j.msg}"
                           }, color = Color.Gray, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall
                       )
                       when (j.st) {
@@ -623,89 +1041,144 @@ jobs:
 
           // ───────────────────────── Escolha de formato ─────────────────────────
           @Composable
+          private fun PickRow(label: String, selected: Boolean, onClick: () -> Unit) {
+              Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                  Text(label, Modifier.weight(1f))
+                  RadioButton(selected, onClick, colors = RadioButtonDefaults.colors(selectedColor = Turq, unselectedColor = Color.Gray))
+              }
+          }
+
+          /** Seletor de formato: Música (M4A, OPUS, OGG, WAV) / Vídeo (144p até 1080p) + botão Baixar. */
+          @Composable
+          fun FormatPicker(title: String, hasList: Boolean, busy: Boolean, onGo: (height: Int?, afmt: String, whole: Boolean) -> Unit) {
+              var sel by remember { mutableStateOf("mp3_192") }        // mp3_128 | mp3_192 | mp3_256 | mp3_320 | m4a | opus | ogg | wav | altura do vídeo (ex.: "720")
+              var whole by remember { mutableStateOf(false) }
+              Column {
+                  Text("Baixar como", style = MaterialTheme.typography.titleLarge)
+                  Text(title, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                  Spacer(Modifier.height(8.dp))
+                  Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
+                      Text("Música", color = Color.Gray)
+                      PickRow("MP3 clássico (128 kbps)", sel == "mp3_128") { sel = "mp3_128" }
+                      PickRow("MP3 192 kbps", sel == "mp3_192") { sel = "mp3_192" }
+                      PickRow("MP3 256 kbps", sel == "mp3_256") { sel = "mp3_256" }
+                      PickRow("MP3 320 kbps", sel == "mp3_320") { sel = "mp3_320" }
+                      PickRow("Rápido (M4A, sem conversão)", sel == "m4a") { sel = "m4a" }
+                      PickRow("OPUS (WEBM) • original, melhor qualidade", sel == "opus") { sel = "opus" }
+                      PickRow("OGG (Opus) • convertido", sel == "ogg") { sel = "ogg" }
+                      PickRow("WAV • sem compressão, arquivo grande", sel == "wav") { sel = "wav" }
+                      Spacer(Modifier.height(6.dp))
+                      Text("Vídeo (MP4)", color = Color.Gray)
+                      PickRow("144p (menor)", sel == "144") { sel = "144" }
+                      PickRow("240p", sel == "240") { sel = "240" }
+                      PickRow("360p (rápido)", sel == "360") { sel = "360" }
+                      PickRow("480p", sel == "480") { sel = "480" }
+                      PickRow("720p (HD)", sel == "720") { sel = "720" }
+                      PickRow("1080p (Full HD)", sel == "1080") { sel = "1080" }
+                  }
+                  if (hasList) Row(Modifier.clickable { whole = !whole }, verticalAlignment = Alignment.CenterVertically) {
+                      Checkbox(whole, { whole = it }, colors = CheckboxDefaults.colors(checkedColor = Turq, checkmarkColor = Color.Black))
+                      Text("Baixar playlist inteira")
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  if (busy) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Turq)
+                  else Button(
+                      { val h = sel.toIntOrNull(); onGo(h, if (h == null) sel else "m4a", whole) }, Modifier.fillMaxWidth(),
+                      colors = ButtonDefaults.buttonColors(containerColor = Turq, contentColor = Color.Black)
+                  ) { Text("Baixar") }
+              }
+          }
+
+          suspend fun startDownload(url: String, title: String, whole: Boolean, height: Int?, afmt: String) {
+              val items = if (whole) runCatching { YtRepo.playlist(YtRepo.playlistUrl(url)).map { it.url to it.title } }.getOrDefault(emptyList())
+                  .ifEmpty { listOf(url to title) }
+              else listOf(url to title)
+              Dl.enqueue(items, height, afmt)
+          }
+
+          @Composable
           fun FormatDialog(url: String, title: String, onDone: () -> Unit) {
               val scope = rememberCoroutineScope()
-              val hasList = remember(url) { YtRepo.hasList(url) }
-              var whole by remember { mutableStateOf(false) }
               var busy by remember { mutableStateOf(false) }
-
-              fun go(h: Int?) = scope.launch {
-                  busy = true
-                  val items = if (whole) runCatching { YtRepo.playlist(YtRepo.playlistUrl(url)).map { it.url to it.title } }.getOrDefault(emptyList())
-                  else listOf(url to title)
-                  if (items.isNotEmpty()) Dl.enqueue(items, h)
-                  onDone()
-              }
-
               AlertDialog(
                   onDismissRequest = onDone, containerColor = Color(0xFF111111),
-                  title = { Text("Escolher formato") },
                   text = {
-                      Column {
-                          Text(title, maxLines = 2, overflow = TextOverflow.Ellipsis, color = Color.Gray)
-                          if (hasList) Row(Modifier.clickable { whole = !whole }, verticalAlignment = Alignment.CenterVertically) {
-                              Checkbox(whole, { whole = it }, colors = CheckboxDefaults.colors(checkedColor = Turq, checkmarkColor = Color.Black))
-                              Text("Baixar playlist inteira")
-                          }
-                          Spacer(Modifier.height(8.dp))
-                          if (busy) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Turq)
-                          else {
-                              Text("Vídeo MP4", color = Turq)
-                              Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                  listOf(144, 360, 720, 1080).forEach { h ->
-                                      OutlinedButton({ go(h) }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("${h}p", color = Turq) }
-                                  }
-                              }
-                              Spacer(Modifier.height(8.dp))
-                              Text("Só áudio", color = Turq)
-                              // O YouTube só entrega AAC/Opus (~128–160 kbps). A conversão para MP3 128/256/320 ainda não foi implementada (veja README).
-                              OutlinedButton({ go(null) }) { Text("Áudio M4A (melhor qualidade)", color = Turq) }
-                          }
+                      FormatPicker(title, YtRepo.hasList(url), busy) { h, a, whole ->
+                          scope.launch { busy = true; startDownload(url, title, whole, h, a); onDone() }
                       }
                   },
                   confirmButton = {}, dismissButton = { TextButton(onDone) { Text("Cancelar", color = Color.Gray) } }
               )
           }
 
-          // ───────────────────────── Pesquisar ─────────────────────────
+          /** Se o app fechou por erro, mostra o motivo na próxima abertura (dá para copiar e me enviar). */
+          @Composable
+          fun CrashReport() {
+              val ctx = LocalContext.current
+              val f = remember { File(ctx.filesDir, "crash.txt") }
+              var text by remember { mutableStateOf(if (f.exists()) f.readText().take(4000) else null) }
+              text?.let { t ->
+                  AlertDialog(
+                      onDismissRequest = {}, containerColor = Color(0xFF111111), title = { Text("O app fechou por um erro") },
+                      text = { Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) { Text(t, fontSize = 10.sp, color = Color.LightGray) } },
+                      confirmButton = { TextButton({ ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("erro", t)) }) { Text("Copiar", color = Turq) } },
+                      dismissButton = { TextButton({ f.delete(); text = null }) { Text("Fechar", color = Color.Gray) } }
+                  )
+              }
+          }
+
+          // ───────────────────────── Link (2ª aba) ─────────────────────────
           @Composable
           fun SearchTab() {
-              val scope = rememberCoroutineScope()
-              var q by remember { mutableStateOf("") }
-              var sugg by remember { mutableStateOf(emptyList<String>()) }
-              var results by remember { mutableStateOf(emptyList<VideoItem>()) }
-              var loading by remember { mutableStateOf(false) }
-              var pick by remember { mutableStateOf<VideoItem?>(null) }
+              val ctx = LocalContext.current
+              var link by remember { mutableStateOf("") }
+              var clip by remember { mutableStateOf<String?>(null) }
+              var bad by remember { mutableStateOf(false) }
+              var dialogUrl by remember { mutableStateOf<String?>(null) }
+              val jobs by Dl.jobs.collectAsState()
 
-              fun doSearch(text: String) = scope.launch {
-                  sugg = emptyList(); loading = true
-                  results = runCatching { YtRepo.search(text) }.getOrDefault(emptyList())
-                  loading = false
+              // Detecta link do YouTube copiado ao abrir/voltar pro app
+              val owner = LocalLifecycleOwner.current
+              DisposableEffect(owner) {
+                  val o = LifecycleEventObserver { _, e ->
+                      if (e == Lifecycle.Event.ON_RESUME) {
+                          val t = runCatching { ctx.getSystemService(ClipboardManager::class.java).primaryClip?.getItemAt(0)?.text?.toString() }.getOrNull()
+                          clip = t?.takeIf { YtRepo.isYt(it) }?.let { YtRepo.extract(it) }
+                      }
+                  }
+                  owner.lifecycle.addObserver(o); onDispose { owner.lifecycle.removeObserver(o) }
               }
-              LaunchedEffect(q) { if (q.length >= 2 && results.isEmpty()) { delay(250); sugg = YtRepo.suggestions(q) } else sugg = emptyList() }
+
+              fun go() { if (YtRepo.isYt(link)) { bad = false; dialogUrl = YtRepo.extract(link) } else bad = true }
 
               Column(Modifier.fillMaxSize().padding(16.dp)) {
                   OutlinedTextField(
-                      q, { q = it; results = emptyList() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Pesquisar no YouTube") },
-                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                      keyboardActions = KeyboardActions(onSearch = { doSearch(q) })
+                      link, { link = it; bad = false }, Modifier.fillMaxWidth(), singleLine = true,
+                      label = { Text("Cole o link do YouTube") },
+                      isError = bad, supportingText = { if (bad) Text("Isso não parece um link do YouTube") },
+                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                      keyboardActions = KeyboardActions(onGo = { go() })
                   )
-                  sugg.forEach { s -> Text(s, Modifier.fillMaxWidth().clickable { q = s; doSearch(s) }.padding(vertical = 10.dp)) }
-                  if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp), color = Turq)
-                  LazyColumn {
-                      items(results, key = { it.url }) { v ->
-                          Row(Modifier.fillMaxWidth().clickable { pick = v }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                              Thumb(v.thumb)
-                              Spacer(Modifier.width(10.dp))
-                              Column {
-                                  Text(v.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                  Text("${v.channel} • ${v.seconds / 60}:${"%02d".format(v.seconds % 60)}", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
-                              }
+                  Button(
+                      { go() }, Modifier.fillMaxWidth().padding(top = 8.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Turq, contentColor = Color.Black)
+                  ) { Text("Baixar") }
+                  clip?.let { c ->
+                      Spacer(Modifier.height(8.dp))
+                      Card(Modifier.fillMaxWidth().clickable { dialogUrl = c }, colors = CardDefaults.cardColors(containerColor = Color(0xFF0F2B28))) {
+                          Column(Modifier.padding(12.dp)) {
+                              Text("Link copiado detectado", color = Turq)
+                              Text(c, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.White)
+                              Text("Toque para baixar", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
                           }
                       }
                   }
+                  if (jobs.isNotEmpty()) {
+                      Text("Downloads", color = Color.Gray, modifier = Modifier.padding(top = 12.dp))
+                      LazyColumn(Modifier.weight(1f)) { items(jobs.reversed(), key = { it.id }) { JobRow(it) } }
+                  }
               }
-              pick?.let { FormatDialog(it.url, it.title) { pick = null } }
+              dialogUrl?.let { FormatDialog(it, it) { dialogUrl = null } }
           }
 
           /** Miniatura carregada sem biblioteca externa (mantém o APK pequeno). */
@@ -1096,6 +1569,13 @@ jobs:
                   <item name="android:statusBarColor">#000000</item>
                   <item name="android:navigationBarColor">#000000</item>
                   <item name="android:colorAccent">#00E5C7</item>
+              </style>
+              <style name="Theme.Lindoso.Sheet" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowIsTranslucent">true</item>
+                  <item name="android:windowBackground">@android:color/transparent</item>
+                  <item name="android:backgroundDimEnabled">true</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">#151515</item>
               </style>
           </resources>
           LINDOSO_EOF
